@@ -1,0 +1,112 @@
+#include <Arduino.h>
+
+/* ================== RTOS QUEUE ================== */
+QueueHandle_t qRawECG;
+QueueHandle_t qFilteredECG;
+
+struct ECGPair {
+  float raw;
+  float filtered;
+};
+
+/* ================== BIQUAD FILTER ================== */
+typedef struct {
+  float b0, b1, b2;
+  float a1, a2;
+  float x1, x2;
+  float y1, y2;
+} Biquad;
+
+float biquad(Biquad *f, float x) {
+  float y = f->b0 * x + f->b1 * f->x1 + f->b2 * f->x2
+            - f->a1 * f->y1 - f->a2 * f->y2;
+  f->x2 = f->x1; f->x1 = x;
+  f->y2 = f->y1; f->y1 = y;
+  return y;
+}
+
+/* ================== FILTER COEFFICIENTS (Fs = 250 Hz) ================== */
+// HPF 0.5 Hz Butterworth order 2 (baseline wander removal - chuẩn diagnostic/monitor)
+Biquad HPF = {
+  0.9932f, -1.9864f, 0.9932f,
+  -1.9864f,  0.9864f,
+  0,0,0,0
+};
+
+// LPF 40 Hz Butterworth order 2 (loại muscle noise cao tần → tín hiệu siêu mịn)
+Biquad LPF = {
+  0.1453f,  0.2906f, 0.1453f,
+   0.6710f, -0.2523f,
+  0,0,0,0
+};
+
+// Notch 50 Hz (giữ nguyên - đã tốt)
+Biquad NOTCH = {
+  0.9695f, -1.6187f, 0.9695f,
+  -1.6187f,  0.9390f,
+  0,0,0,0
+};
+
+/* ================== TASKS ================== */
+void TaskADC(void *pv) {
+  uint16_t adc;
+  TickType_t xLastWakeTime = xTaskGetTickCount();
+  while (1) {
+    adc = analogRead(34);
+    xQueueSend(qRawECG, &adc, 0);
+    vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(4)); // 250 Hz chính xác
+  }
+}
+
+void TaskFilter(void *pv) {
+  uint16_t raw_adc;
+  float ecg_raw, ecg_filt;
+  static float dc = 0.0f;
+  ECGPair pair;
+
+  while (1) {
+    if (xQueueReceive(qRawECG, &raw_adc, portMAX_DELAY)) {
+      // DC removal chậm hơn một chút (hỗ trợ HPF)
+      dc = 0.999f * dc + 0.001f * raw_adc;
+      ecg_raw = raw_adc - dc;
+
+      // Thứ tự lọc tối ưu: HPF → Notch → LPF (loại baseline trước, nhiễu lưới, rồi cao tần)
+      ecg_filt = biquad(&HPF, ecg_raw);
+      ecg_filt = biquad(&NOTCH, ecg_filt);
+      ecg_filt = biquad(&LPF, ecg_filt);
+
+      // Clip nhẹ
+      ecg_filt = constrain(ecg_filt, -800.0f, 800.0f);
+      ecg_raw  = constrain(ecg_raw, -800.0f, 800.0f);
+
+      pair.raw = ecg_raw;
+      pair.filtered = ecg_filt;
+      xQueueSend(qFilteredECG, &pair, 0);
+    }
+  }
+}
+
+void TaskUART(void *pv) {
+  ECGPair pair;
+  char buffer[64];
+  while (1) {
+    if (xQueueReceive(qFilteredECG, &pair, portMAX_DELAY)) {
+      snprintf(buffer, sizeof(buffer), "%.2f,%.2f", pair.raw, pair.filtered);
+      Serial.println(buffer);
+    }
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  analogReadResolution(12);
+
+  qRawECG = xQueueCreate(128, sizeof(uint16_t));
+  qFilteredECG = xQueueCreate(128, sizeof(ECGPair));
+
+  xTaskCreatePinnedToCore(TaskADC,    "ADC",    2048, NULL, 3, NULL, 1);
+  xTaskCreatePinnedToCore(TaskFilter, "Filter", 4096, NULL, 2, NULL, 1);
+  xTaskCreatePinnedToCore(TaskUART,   "UART",   2048, NULL, 1, NULL, 1);
+}
+
+void loop() {}
