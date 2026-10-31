@@ -1,0 +1,101 @@
+import serial
+import numpy as np
+import matplotlib.pyplot as plt
+from collections import deque
+
+# ================= CONFIG =================
+COM_PORT = "COM3"
+BAUDRATE = 115200
+FS = 250
+WINDOW = 2000
+
+ser = serial.Serial(COM_PORT, BAUDRATE, timeout=0.1)
+
+raw_buf = deque(maxlen=WINDOW)
+filt_buf = deque(maxlen=WINDOW)
+r_peaks = deque(maxlen=50)
+
+# Pan–Tompkins params
+MOV_WIN = int(0.150 * FS)
+REFRACTORY = int(0.250 * FS)
+
+SPKI, NPKI = 0, 0
+THRESH = 0
+last_r = -REFRACTORY
+bpm = 0
+
+def pan_tompkins(x):
+    x = (x - np.mean(x)) / (np.std(x) + 1e-6)
+    d = np.convolve(x, [-1, -2, 0, 2, 1], 'same') / 8
+    s = d ** 2
+    i = np.convolve(s, np.ones(MOV_WIN)/MOV_WIN, 'same')
+    return i
+
+# ================= PLOT =================
+plt.ion()
+fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 7), sharex=True)
+
+l1, = ax1.plot([], [], 'b', label='ECG Raw (chưa lọc)')
+l2, = ax2.plot([], [], 'r', label='ECG Filtered')
+sc = ax2.scatter([], [], c='red')
+
+ax1.legend(); ax2.legend()
+ax1.set_ylabel("mV")
+ax2.set_ylabel("mV")
+ax2.set_xlabel("Samples")
+
+bpm_text = ax1.text(0.85, 0.9, "BPM: --",
+                    transform=ax1.transAxes,
+                    bbox=dict(fc='white'))
+
+# ================= MAIN LOOP =================
+while True:
+    while ser.in_waiting:
+        try:
+            raw, filt = map(float, ser.readline().decode().split(','))
+            raw_buf.append(raw)
+            filt_buf.append(filt)
+        except:
+            pass
+
+    if len(filt_buf) < FS:
+        plt.pause(0.01)
+        continue
+
+    raw = np.array(raw_buf)
+    filt = np.array(filt_buf)
+
+    integ = pan_tompkins(filt)
+    idx = len(filt) - 1
+
+    if integ[-1] > THRESH and (idx - last_r) > REFRACTORY:
+        last_r = idx
+        r_peaks.append(idx)
+
+        if len(r_peaks) > 1:
+            rr = (r_peaks[-1] - r_peaks[-2]) / FS
+            if 0.3 < rr < 2.0:
+                bpm = int(60 / rr)
+
+        SPKI = 0.125 * integ[-1] + 0.875 * SPKI
+    else:
+        NPKI = 0.125 * integ[-1] + 0.875 * NPKI
+
+    THRESH = NPKI + 0.25 * (SPKI - NPKI)
+
+    # Plot
+    n = len(raw)
+    l1.set_data(range(n), raw)
+    l2.set_data(range(n), filt)
+
+    rx = list(r_peaks)
+    ry = [filt[i] for i in rx]
+    sc.set_offsets(np.c_[rx, ry])
+
+    for ax, d in zip([ax1, ax2], [raw, filt]):
+        mi, ma = np.min(d), np.max(d)
+        ax.set_ylim(mi - 0.3*(ma-mi), ma + 0.3*(ma-mi))
+        ax.set_xlim(max(0, n-1000), n)
+
+    bpm_text.set_text(f"BPM: {bpm if bpm > 30 else '--'}")
+    plt.pause(0.01)
